@@ -1,6 +1,6 @@
 // ============================================================================
 //  etw_kernel_monitor.cpp
-//
+//	Author: Ghanashyam Satpathy
 //  Real-time ETW consumer using a CUSTOM session name (not KERNEL_LOGGER_NAME).
 //  Enables Process, File I/O and Registry kernel providers individually via
 //  EnableTraceEx2, and parses event payloads with TDH helpers.
