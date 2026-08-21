@@ -14,6 +14,50 @@
 //      Press Ctrl+C to stop.
 // ============================================================================
 
+// ─── logman: enumerate & troubleshoot ETW sessions ───────────────────────────
+//
+//  An ETW session is a kernel-managed object, not tied to the lifetime of the
+//  process that created it -- StartTrace() registers it and it keeps running
+//  system-wide until something explicitly stops it. If this process is killed
+//  or crashes before Shutdown() runs, the session (name: k_SessionName below,
+//  "MyProduct_KernelMonitor") is orphaned: still consuming buffers, but with
+//  no consumer reading from it. StartSession()'s ERROR_ALREADY_EXISTS branch
+//  handles this in-code on next launch, but `logman` is the manual, outside-
+//  the-process equivalent -- useful when you want to inspect or intervene
+//  without running this tool at all. All commands need an elevated prompt.
+//
+//  List every ETW session currently running on the machine (ours plus any
+//  other tool's -- Defender, sysmon, profilers, etc. all show up here):
+//      logman query -ets
+//
+//  Query this session specifically -- while it's running, shows which
+//  providers are enabled, with what keywords/level, and buffer settings:
+//      logman query "MyProduct_KernelMonitor" -ets
+//
+//  Force-stop this session manually -- the fix for "StartTrace failed:
+//  ERROR_ALREADY_EXISTS" if you'd rather clear it by hand than let
+//  StartSession()'s automatic recovery do it on the next run:
+//      logman stop "MyProduct_KernelMonitor" -ets
+//
+//  List every ETW provider registered on the system -- confirms a provider
+//  name/GUID resolves at all, or find one by partial name:
+//      logman query providers
+//      logman query providers | findstr /i "Kernel-Process"
+//
+//  Dump one provider's keyword/level/task table from its live manifest --
+//  the way to independently verify the PROC_KW_*/FILE_KW_*/REG_KW_* keyword
+//  values hardcoded above still match this machine's Windows build, since
+//  they come from the provider's manifest, not a public, versioned ABI:
+//      logman query providers "Microsoft-Windows-Kernel-Process"
+//      logman query providers "Microsoft-Windows-Kernel-File"
+//      logman query providers "Microsoft-Windows-Kernel-Registry"
+//
+//  If StartTrace() fails with something other than ERROR_ALREADY_EXISTS or
+//  ERROR_ACCESS_DENIED (not elevated), `logman query -ets` doubling as a
+//  session count is the next thing to check -- Windows caps the number of
+//  concurrent ETW trace sessions (historically 64); a heavily-instrumented
+//  machine (EDR, multiple profilers) can genuinely hit that ceiling.
+
 #define UNICODE
 #define _UNICODE
 #define INITGUID
