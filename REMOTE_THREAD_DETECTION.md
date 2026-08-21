@@ -8,7 +8,7 @@ A kernel-level ETW (Event Tracing for Windows) monitoring utility that detects c
 
 - **Detects** remote thread creation across processes (where caller PID ≠ target PID)
 - **Resolves** both caller and target processes to their full executable paths
-- **Analyzes** the thread's entry point (`Win32StartAddr`) against loaded modules in the target process
+- **Analyzes** the thread's entry point (`Win32StartAddr`) against loaded modules in the target process, resolving it to the nearest named export (e.g. `kernel32.dll!LoadLibraryA+0x5`) where possible
 - **Identifies** injected code by flagging thread starts in unmapped memory regions
 
 This makes it immediately clear whether a remote thread is starting in a legitimate loaded DLL/EXE or in private (injected) memory — a key signal for detecting code injection attacks.
@@ -21,6 +21,7 @@ This makes it immediately clear whether a remote thread is starting in a legitim
   - a process's own initial thread, created by its parent as part of normal `CreateProcess()`
   - threads created inside kernel-mode minimal/pico processes (e.g. `MemCompression`), which have no usermode context and can't be a `CreateRemoteThread()` target in the first place
 - **Module tracking** via image-load provider (tracks all DLL/EXE loads per process)
+- **Export-symbol resolution** — `Win32StartAddr` resolves past "which module" to "which named function nearby", so `kernel32.dll+0x42990` becomes `kernel32.dll!LoadLibraryA+0x5` — exactly the shape of `inject_test.py`'s own `loadlibrary` technique — without needing a separate lookup
 - **Smart address resolution** that probes multiple data types to handle cross-Windows-version schema variations
 - **Deferred event resolution** with 300ms grace period to account for cross-CPU ETW delivery ordering
 - **Full event payload inspection** — all raw event properties are captured and displayed
@@ -68,6 +69,20 @@ The code probes each type in sequence until one parses successfully, swallowing 
 
 Before reporting an address as `<UNBACKED -- possible injected code>`, the tool confirms that the target process's own main executable has been recorded in the module cache. This prevents false positives during process startup when early modules (e.g., ntdll.dll) arrive before the main image.
 
+### Export-Symbol Resolution
+
+`module+0xN` tells you which file a thread starts in, but not what's there — an analyst still has to look up that offset by hand. Resolving the nearest preceding *named export* turns `kernel32.dll+0x42990` into `kernel32.dll!LoadLibraryA+0x5`, immediately recognizable as the exact shape of the classic remote-LoadLibrary injection technique (which is exactly what `inject_test.py --mode loadlibrary` produces, and what this now shows for it).
+
+Exports are read directly off the on-disk PE file via `LoadLibraryExW(..., LOAD_LIBRARY_AS_IMAGE_RESOURCE)` — this maps the file with real, RVA-correct layout (so the export directory's RVAs line up against the mapped base) but runs no code: no `DllMain`, no import resolution. That's a deliberate choice over the older `DONT_RESOLVE_DLL_REFERENCES` flag, which is now documented as deprecated. Because this reads the module from disk rather than inspecting the live target process, it's independent of ASLR — a file's *internal* RVA layout is identical everywhere; only its runtime base address differs per-process, and that's already handled separately by `resolve_module_address()`'s own base/size bookkeeping.
+
+Verified empirically before trusting it: a standalone test parsed `kernel32.dll`'s export table this same way and found `LoadLibraryA` at RVA `0x42990` — an exact match against the ground truth from actually loading the DLL and calling `GetProcAddress`.
+
+A few deliberate limits:
+- **64KB max distance.** Beyond `kMaxSymbolDistance` from the nearest preceding export, the tool falls back to a bare `module+0xN` rather than a specific attribution — claiming `!SomeFunction+0x50000` would misleadingly imply the address is *within* that function, when it's really just somewhere in a large stretch of unexported internal code that happens to follow it.
+- **Cached per module path** (`load_module_exports_cached()`), including caching a failed/empty parse, so a long-running trace doesn't repeatedly re-read and re-parse the same commonly-referenced DLL (`kernel32.dll`, `ntdll.dll`) for every event that lands in it.
+- **SEH-guarded, isolated in a PODs-only function.** The export directory's internal arrays are untrusted input the tool didn't produce — a corrupt or hostile `NumberOfNames`/RVA could otherwise cause an access violation while walking it. `__try`/`__except` handles that, but MSVC (`C2712`) won't allow SEH in a function that also has local C++ objects needing unwind (like a `std::vector<std::string>`), so the actual pointer-walking is isolated in `collect_exports_raw()`, which only ever touches `DWORD`s and fixed-size `char[256]` buffers.
+- **32-bit modules aren't resolved** when this 64-bit-only tool can't map them (`LoadLibraryExW` fails with an architecture mismatch for a WoW64 target's modules) — falls back to bare `module+0xN`, same as the "32-bit Processes on 64-bit Windows" limitation already covered below.
+
 ### Initial-Thread Filtering
 
 Every process's *first* thread is created by its parent, as part of `CreateProcess()` — the parent's own thread executes the kernel code that creates the new process object and its initial thread, before the child ever runs an instruction. The resulting kernel event always has caller PID (the parent) ≠ target PID (the child), which is indistinguishable from real injection by PID pattern alone. Left unfiltered, this fires on **every process launch**, making the tool nearly unusable on any real workload.
@@ -77,6 +92,25 @@ The tool tracks each process's `ParentId` and creation timestamp (from the proce
 - the thread-create event falls within 500ms of the process-create event
 
 Requiring the tight time window (not just the PID match) is what distinguishes normal process startup from a parent injecting into an *already-running* child later (e.g. process hollowing) — the latter happens well outside that window.
+
+#### Bug: This Check Was Racing Against the Exact Race It Exists to Handle
+
+This check originally ran synchronously inside `handle_thread_event()`, at the moment the thread-create event arrived — looking up the target's `ParentId` in the process-name cache immediately, with no wait. That's the same cross-CPU delivery race documented throughout this file (see "Deferred Resolution Pattern" below): a target process's Thread-Start event can arrive *before* its own Process-Start event has been processed, if they land on different CPU cores. When that happened, `is_initial_process_thread()`'s cache lookup would simply miss — not because the event wasn't genuinely the process's first thread, but because the tool hadn't learned about the process yet — and a real "process being born" event would incorrectly fall through as an unfiltered `[!] Remote thread created` (or, once signature verification and export resolution were added, as a plausible-looking `[?] Cross-component same-publisher thread` with a real signed target, as happened with a `devenv.exe → VCPkgSrv.exe` event that looked exactly like this).
+
+Every other cross-provider check in this tool (Win32StartAddr module resolution, Authenticode verification) already waits out `kResolveDelay` on the resolver thread before running, specifically to let this race resolve. `is_initial_process_thread()` didn't, because it needed to run early to decide whether to suppress the event *before* queuing it. The fix: don't decide synchronously. `handle_thread_event()` now always queues the event (capturing only `thread_event_time`), and `print_pending_event()` calls the check after the same grace period everything else already waits out — the process-name cache has had the same chance to catch up by then.
+
+#### Diagnosing a Still-Unfiltered Event (`-v`)
+
+After the fix above, the same `devenv.exe → VCPkgSrv.exe` pattern kept showing up unfiltered on a real run — which could mean the race is still being lost somehow, or could mean this specific event genuinely isn't the process's first thread (e.g. a *second* thread devenv.exe creates in an already-running `VCPkgSrv.exe`, sometime after it started — a structurally different, real remote-thread-into-an-existing-process event, just still very plausibly benign given the matching signature). Those two situations are easy to conflate by eye but need different explanations, so rather than guess, `diagnose_initial_process_thread()` now exposes *why* the verdict came out the way it did, printed under `-v`:
+
+```
+    [diag] initial-thread check: target's Process-Start event not in cache yet
+```
+— still racing; the process-name cache hasn't caught up even after the grace period (would point to `kResolveDelay` needing to be longer on this machine), versus:
+```
+    [diag] initial-thread check: recorded ParentId=45240 (caller=45240, match=yes)  time delta=1847ms  verdict=not initial thread
+```
+— not a race at all: the target's parent is correctly recorded and matches, but 1847ms have passed since the process was created, well outside the 500ms window — a second thread into an already-running process, not the process being born.
 
 ### Kernel-Mode Target Filtering
 
@@ -143,6 +177,55 @@ This is deliberately kept in the *labeled, not suppressed* tier — `[?] Cross-c
 The service group is sitting right there on svchost's own `CommandLine` (`-k <group>`), so `extract_svchost_service_group()` reads it and prints `Caller svchost service group: -k netsvcs` alongside the event — always on, no flag needed, since it's a cheap string search over already-cached data, not a new capability with a latency cost like signature verification.
 
 This is deliberately **display-only, not a filter** — unlike `csrss.exe` (a single, narrow, well-known role; see "Initial-Thread Filtering" above), `svchost.exe` hosts wildly different services with wildly different behavior, and it's also one of the most commonly masqueraded process names in real-world malware precisely because it's so common and usually ignored. A blanket "svchost.exe is safe" rule would be a much larger blind spot than the equivalent csrss.exe one. Surfacing the service group gives a human the context to judge quickly, without the tool claiming a certainty it doesn't have.
+
+### Bug: Pre-Existing Processes' Modules Were Never Known (Fixed via a Live Snapshot, Not ETW Rundown)
+
+A live capture with `-v -s` showed `<incomplete module info>` on roughly 90% of events (817 of 905 in one run), including for `wininit.exe` and `winlogon.exe` — processes that are created exactly once, at boot, and never again. Those two are the tell: if module info were merely racing (the transient case "Deferred Resolution Pattern" above handles), it would eventually resolve; for a process that's been running since boot, it never will, no matter how long the trace runs.
+
+**Root cause:** `resolve_module_address()`'s "main-image confirmation" gate needs an Image-Load event for the target's *own* main executable to be in `g_process_modules` before it will resolve anything. That event only ever arrived via real-time Load events (opcode 10, for anything that loads *after* the trace starts) — nothing backfilled it for modules that were already loaded when the trace began, which on a running desktop is nearly everything. `process_provider`'s equivalent (`ParentId`, creation timestamp) worked correctly for these same pre-existing processes throughout this whole investigation without any special handling — process Start/DCStart rundown for already-running processes is automatic, classic NT Kernel Logger behavior (see `kernel_trace_003_rundown.cpp`'s own doc comment) — which made the image-load gap easy to miss at first, since the *process* half of the picture looked fine.
+
+**First attempt (didn't work): ETW rundown.** `krabs::provider::set_rundown_flags()` exists to request exactly this — a DCStart image-load event replayed at trace-start for whatever's already loaded — so `image_load_provider.set_rundown_flags(EVENT_TRACE_FLAG_IMAGE_LOAD)` was added, reusing the same flag bit the provider already uses for its real-time `EnableFlags`. A second live capture after rebuilding still showed `wininit.exe`/`winlogon.exe`/`csrss.exe` permanently `<incomplete module info>` — one case even at a 131-second delta, well past any possible race. `set_rundown_flags()` does carry its own doc comment — *"This ETW feature is undocumented and should be used with caution"* — and this was that caution paying off.
+
+**Diagnosing why, instead of guessing again:** `kt::forward_events()` (`kt.hpp`) only invokes a provider's callback when `record.EventHeader.ProviderId` exactly matches that provider's registered GUID — anything else is silently dropped unless a default callback is set. A temporary `trace.set_default_event_callback()` was wired up to catch anything none of the three registered providers claimed, to see whether the rundown request was producing events under an unexpected `ProviderId`. It caught exactly 5 events across a ~3,400-line capture, all under `{68FDD900-4A3E-11D1-84F4-0000F80464E3}` — which turned out, checking the SDK headers directly, to be `EventTraceGuid`: the standard trace-lifecycle/header metadata every kernel session emits regardless of what's enabled. Not image-load data at all, and far too few events to represent rundown for every loaded module in every process on the system. Conclusion: the rundown request wasn't landing under the wrong identity — it wasn't producing anything.
+
+**Actual fix: don't depend on ETW rundown at all.** `populate_modules_from_live_snapshot()` queries the live process directly via the standard, documented Process Status API (`OpenProcess` + `EnumProcessModulesEx` + `GetModuleInformation`/`GetModuleFileNameExW`) as a fallback whenever the passive ETW-based cache lacks the target's main image — which works identically whether the process predates the trace or not, since it doesn't depend on ETW history in the first place. It overwrites `g_process_modules[pid]` outright rather than merging: if the main image was missing, the rest of that PID's ETW-derived module list is equally suspect, and a fresh live snapshot is by construction more complete. Verified empirically before trusting it: a standalone test enumerated `explorer.exe`'s 451 loaded modules this same way, without elevation, and found its own main image (`C:\WINDOWS\Explorer.EXE`) correctly listed as the first entry.
+
+The failed rundown attempt and its diagnostic callback were both removed once they'd answered the question — `image_load_provider` no longer calls `set_rundown_flags()`, and `handle_unrouted_event()`/`set_default_event_callback()` are gone.
+
+**Result, confirmed live**: resolution rate went from 3% (13 of 905 events) to 54% (118 of 218) after the live-snapshot fallback landed — a real, measured improvement, not a guess. But `wininit.exe`/`winlogon.exe`/`csrss.exe` still failed, now with a more specific message (`not recorded by ETW, and no live snapshot available (process likely already exited)`) — misleading for these three specifically, since they don't exit.
+
+### Follow-on Bug: Elevation Alone Doesn't Grant OpenProcess on Protected System Processes
+
+A bounded diagnostic (`[diag] live-snapshot OpenProcess failed for PID ... GetLastError=...`, capped at 10 lines) was added to `populate_modules_from_live_snapshot()` to see exactly why `OpenProcess()` was failing for these three specifically. The expected answer, and the standard reason any process-inspection tool (Task Manager, Process Explorer) needs it: an elevated/Administrator token *holds* `SeDebugPrivilege`, but it's **disabled by default** — it has to be explicitly enabled via `AdjustTokenPrivileges` before `OpenProcess()` can reach protected or cross-session system processes, even from an already-elevated process. `wininit.exe` and a non-interactive-session `csrss.exe` run in Session 0 (the non-interactive services session); `winlogon.exe` is heavily access-restricted regardless of session. Administrator elevation was never going to be enough for these three on its own.
+
+`enable_debug_privilege()` now runs once at startup (`OpenProcessToken` → `LookupPrivilegeValueW(SE_DEBUG_NAME)` → `AdjustTokenPrivileges`, checking `ERROR_NOT_ALL_ASSIGNED` specifically, since `AdjustTokenPrivileges` can report overall success while still failing to enable the one privilege requested) and prints a warning if it fails, rather than degrading silently.
+
+**Result, confirmed live**: resolution rate went from 54% to 94% (169 of 179 events) after `SeDebugPrivilege` was enabled — no warning printed at startup, confirming it succeeded. A bounded diagnostic (`GetLastError=...`, capped at 10 lines) was added first to `populate_modules_from_live_snapshot()` to see exactly why the handful of remaining failures were still happening, rather than guess again.
+
+### The Last 6%: Two Permanent, Expected Cases — Not Bugs
+
+The diagnostic surfaced two distinct `GetLastError` codes, both fully explained and neither fixable:
+
+- **`GetLastError=5` (`ERROR_ACCESS_DENIED`)** — for `csrss.exe` and `wininit.exe` specifically, even with `SeDebugPrivilege` successfully enabled. These are **Protected Process Light (PPL)** processes at the `WinTcb` protection level, Windows' strongest process-isolation tier. PPL is a categorically different, deliberately un-bypassable boundary from ordinary discretionary access control: `SeDebugPrivilege` grants access *despite* normal ACLs, but it does not and cannot grant access to a higher protection level than the calling process has. No Administrator process — privileged or not — can `OpenProcess()` a `WinTcb`-level process. This is correct, permanent OS behavior, not a gap to keep closing.
+- **`GetLastError=87` (`ERROR_INVALID_PARAMETER`)** — for everything else that still failed. This is what `OpenProcess()` returns for a PID that no longer corresponds to a running process: the ordinary, expected outcome for a short-lived process that had already exited by the time the resolver thread (300ms+ after the event) got around to it. Not a bug — an inherent race for genuinely ephemeral processes that no snapshot mechanism can close.
+
+While fixing this, a real formatting bug was found and fixed along the way: `populate_modules_from_live_snapshot()`'s original diagnostic `std::cout` fired *mid-expression*, while the caller's `"    Win32StartAddr -> " << resolve_module_address(...)` was still being evaluated — the diagnostic line would interleave itself between the `"Win32StartAddr -> "` prefix and the actual resolved value, splitting one logical line into two confusing ones. The fix: `populate_modules_from_live_snapshot()` now returns a `live_snapshot_result` enum (`populated` / `access_denied` / `unavailable`) instead of printing anything itself, so the caller can fold the reason into a single, correctly-formatted return string — `<incomplete module info -- target is a Protected Process Light system process...>` for the PPL case, distinct from the generic "not recorded, no live snapshot" message for the exited-process case.
+
+### Bug: Cross-Thread Output Interleaving
+
+A live capture surfaced a second, unrelated formatting bug in the raw log: a periodic `[stats] events handled=...` line spliced into the middle of a `Win32StartAddr -> ...` line — `Win32StartAddr -> [stats] events handled=36063 ...`. Unlike the single-threaded mid-expression bug above, this one is a genuine cross-thread race: `print_pending_event()` (resolver thread), `log_trace_stats()` (stats thread), and `handle_image_load_event()`'s rare diagnostic dump (the ETW callback thread) all write multi-line blocks to `std::cout` independently. Each individual `<<` call is internally thread-safe, but the *sequence* of calls composing one logical block is not — three different threads can each be partway through their own multi-line block at the same moment, and their output interleaves arbitrarily.
+
+`g_cout_mutex` now guards each of those three blocks as a whole via RAII (`std::lock_guard`), so one thread's full block completes atomically before another's can start. Held only around the actual printing, not the resolution/verification work that precedes it (signature checks, module resolution) — so a slow `WinVerifyTrust` call doesn't block the stats thread's line, just the eventual printing of it. (`resolve_module_address()` wasn't actually following that rule yet at the time this was first written — see the next section.)
+
+### Full Threading Audit: Two Related Lock-Scope Issues
+
+Prompted by a request to review the whole file for cross-thread races, not just chase individual symptoms. Every shared global was checked against every thread that touches it (main/ETW-callback thread, resolver thread, stats thread, the OS-spawned Ctrl+C handler thread): `g_process_names`/`g_process_start_info`/`g_process_command_lines` (`g_process_names_mutex`), `g_process_modules` (`g_process_modules_mutex`), `g_export_cache` (`g_export_cache_mutex`), `g_pending_events` (`g_pending_mutex`), `g_cout_mutex` itself, plus the plain (non-atomic) `g_verbose`/`g_verify_signatures`/`g_trace` globals. Most were already correct. Two related issues weren't — both about a lock held too long, not a missing lock:
+
+1. **`resolve_module_address()` held `g_process_modules_mutex` across `resolve_nearest_export()`.** That call can trigger an uncached `LoadLibraryExW()` + PE-export-parse (see "Export-Symbol Resolution" above) — real, possibly-slow work. `g_process_modules_mutex` is also what `handle_image_load_event()` needs, and that callback runs on the **single ETW dispatch thread that delivers every kernel event** — process, thread, and image-load alike, since `ProcessTrace()` delivers them all on one thread, in order. Holding this lock across slow work on the resolver thread risked stalling *all* kernel event processing for however long that took — exactly the failure mode `kResolveDelay`, tuned trace buffers, and deferring signature verification off the callback thread were all built to avoid, just reintroduced through a narrower door. Fixed by copying out the one matching `module_info` while holding the lock only for the lookup itself, then releasing it before calling `resolve_nearest_export()`.
+
+2. **`print_pending_event()` held `g_cout_mutex` across the same `resolve_module_address()` call.** Not a stall risk for the callback thread (different mutex), but inconsistent with how `caller_sig`/`target_sig` are deliberately resolved *before* `g_cout_mutex` is acquired — the exact same reasoning applies to module resolution and wasn't being followed. Fixed by resolving `Win32StartAddr` into a local `std::optional<std::string>` before acquiring the lock, alongside the signature checks, and printing the already-computed value inside it.
+
+Neither was a data race (no torn reads, no undefined behavior) — both were about lock scope being wider than necessary, delaying threads that had nothing to do with the work being protected.
 
 ### Trace Buffer Tuning & EventsLost Tracking
 
@@ -219,7 +302,7 @@ remote_thread_detect.exe
 ```
 Monitoring for remote thread creation... (Ctrl+C to stop)
 [!] Remote thread created: caller PID=1234 (C:\path\to\caller.exe)  target PID=5678 (C:\path\to\target.exe)
-    Win32StartAddr -> C:\Windows\System32\kernel32.dll+0x42990
+    Win32StartAddr -> C:\Windows\System32\kernel32.dll!LoadLibraryA+0x5
       ProcessId = 5678
       TThreadId = 9012
       ... (all event properties)
@@ -283,7 +366,8 @@ Where `<resolution>` is one of:
 
 | Resolution | Meaning |
 |-----------|---------|
-| `path\module.dll+0x1234` | Thread starts in a known loaded module (normal/legitimate) |
+| `path\module.dll!ExportName+0x12` | Thread starts near a named export in a known loaded module (normal/legitimate) — see "Export-Symbol Resolution" above |
+| `path\module.dll+0x1234` | Thread starts in a known loaded module, but no named export was close enough to attribute it to (module has no exports, or the nearest one is more than 64KB away) |
 | `<UNBACKED -- not inside any known loaded module (possible injected code)>` | Address is in private/unmapped memory (suspicious — suggests injected code or shellcode) |
 | `<incomplete module info for this PID -- main executable not yet recorded by image rundown>` | Module cache not yet populated (usually during initial process startup); wait and re-check |
 
@@ -326,10 +410,10 @@ python inject_test.py
 **Expected Output in Detector:**
 ```
 [!] Remote thread created: caller PID=39668 (python)  target PID=33436 (C:\Windows\System32\notepad.exe)
-    Win32StartAddr -> C:\Windows\System32\kernel32.dll+0x42990
+    Win32StartAddr -> C:\Windows\System32\kernel32.dll!LoadLibraryA+0x5
 ```
 
-The thread starts in `kernel32.dll` — a legitimate module. This is a safe injection technique (remoting a function call into another process's already-loaded code).
+The thread starts at `kernel32.dll!LoadLibraryA` — a legitimate, named export, not just an unattributed offset. This is a safe injection technique (remoting a function call into another process's already-loaded code) — and now the tool names the exact function being called, rather than just the module it lives in.
 
 ### Test Scenario 2: Shellcode Injection
 

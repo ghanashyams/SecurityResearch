@@ -26,10 +26,11 @@
 #include <chrono>
 #include <string>
 #include <optional>
+#include <cstring>
 #include "..\..\krabs\krabs.hpp"
 #include <psapi.h>
 #include <wincrypt.h>
-#include <softpub.h>
+#include <softpub.h> 
 #include <wintrust.h>
 // The project targets _WIN32_WINNT=0x601 (Windows 7) for broad example
 // compatibility, but CryptCATAdminAcquireContext2/...FromFileHandle2 --
@@ -137,7 +138,56 @@ bool g_verbose = false;
 // on why blocking the callback thread risks EventsLost.
 bool g_verify_signatures = false;
 
+// Multiple threads write multi-line blocks to std::cout independently (the
+// ETW callback thread's diagnostic dumps, the resolver thread's per-event
+// output, the stats thread's periodic line) -- each individual `<<` call
+// is thread-safe, but the *sequence* composing one logical block is not,
+// so without this those blocks can (and, confirmed live, does) interleave
+// mid-line -- e.g. a "[stats] ..." line splicing itself into the middle of
+// a "Win32StartAddr -> ..." line. Guards a whole block at a time via RAII,
+// not individual writes.
+std::mutex g_cout_mutex;
+
 constexpr uint32_t SYSTEM_PID = 4;
+
+// --- Debug privilege -----------------------------------------------------
+//
+// Administrator elevation (already required for kernel ETW tracing) does
+// NOT by itself grant OpenProcess() access to every process -- a handful of
+// protected/cross-session system processes (wininit.exe, winlogon.exe, a
+// non-interactive-session csrss.exe) still return ERROR_ACCESS_DENIED. An
+// elevated token *holds* SeDebugPrivilege, but it's disabled by default;
+// it has to be explicitly enabled, the same way Task Manager/Process
+// Explorer/every other process-inspection tool does at startup, before
+// populate_modules_from_live_snapshot()'s OpenProcess() calls can reach
+// those processes.
+bool enable_debug_privilege()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token)) {
+        return false;
+    }
+
+    LUID luid = {};
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(token);
+        return false;
+    }
+
+    TOKEN_PRIVILEGES privileges = {};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+    DWORD adjust_error = GetLastError();
+    CloseHandle(token);
+
+    // AdjustTokenPrivileges can report success (nonzero return) while still
+    // failing to enable the specific privilege requested -- checking
+    // ERROR_NOT_ALL_ASSIGNED is the documented way to catch that case.
+    return adjusted && adjust_error != ERROR_NOT_ALL_ASSIGNED;
+}
 
 // --- Clean shutdown ----------------------------------------------------
 //
@@ -347,19 +397,45 @@ std::optional<std::string> extract_svchost_service_group(const std::string &comm
 // parent reached into its child after the fact".
 constexpr int64_t kInitialThreadWindow100ns = 500 * 10'000; // 500ms, in 100ns FILETIME ticks
 
-bool is_initial_process_thread(uint32_t target_pid, uint32_t caller_pid, int64_t thread_event_time)
+// Broken out from a plain bool so a "not the initial thread" verdict can be
+// explained, not just asserted -- see its use under -v in print_pending_event.
+// Distinguishing "target's Process-Start event isn't in the cache at all"
+// from "it's there, but ParentId/timing didn't match" is exactly the
+// question needed to tell apart two very different situations that would
+// otherwise look identical from the outside: the cross-provider race this
+// check already lost to once (see "Bug: This Check Was Racing..." in the
+// docs) versus a target process that's just genuinely receiving a *second*
+// thread sometime after it was created, which is a structurally different
+// (and real) remote-thread-into-an-existing-process event, however likely
+// benign it turns out to be otherwise.
+struct initial_thread_diagnosis {
+    bool found_process_start_info;
+    uint32_t recorded_parent_id; // meaningful only if found_process_start_info
+    int64_t delta_100ns;         // meaningful only if found_process_start_info
+    bool is_initial_thread;
+};
+
+initial_thread_diagnosis diagnose_initial_process_thread(uint32_t target_pid, uint32_t caller_pid, int64_t thread_event_time)
 {
+    initial_thread_diagnosis result = {};
+
     std::lock_guard<std::mutex> lock(g_process_names_mutex);
     auto it = g_process_start_info.find(target_pid);
-    if (it == g_process_start_info.end() || it->second.parent_id != caller_pid) {
-        return false;
+    if (it == g_process_start_info.end()) {
+        return result;
     }
+
+    result.found_process_start_info = true;
+    result.recorded_parent_id = it->second.parent_id;
 
     int64_t delta = thread_event_time - it->second.start_time;
     if (delta < 0) {
         delta = -delta;
     }
-    return delta <= kInitialThreadWindow100ns;
+    result.delta_100ns = delta;
+
+    result.is_initial_thread = (it->second.parent_id == caller_pid) && (delta <= kInitialThreadWindow100ns);
+    return result;
 }
 
 // --- Loaded-module cache, keyed by PID --------------------------------------
@@ -416,6 +492,7 @@ void handle_image_load_event(const EVENT_RECORD &record, const krabs::trace_cont
     // directly instead of guessed again.
     static std::atomic<int> diagnostic_dumps{ 0 };
     if ((!got_base || !got_size) && diagnostic_dumps.fetch_add(1) < 5) {
+        std::lock_guard<std::mutex> cout_lock(g_cout_mutex); // see its comment
         std::cout << "[diag] image event opcode=" << opcode << " pid=" << pid
                   << "  got_base=" << got_base << " got_size=" << got_size << std::endl;
         print_event_payload(parser);
@@ -490,6 +567,324 @@ std::string strip_volume_prefix(const std::string &path)
     return path;
 }
 
+// Several Win32 file APIs (WinVerifyTrust, LoadLibraryExW) reject NT
+// device paths outright ("\Device\HarddiskVolume4\..." -- what
+// resolve_process_path()'s GetProcessImageFileNameW fallback produces).
+// The \\?\GLOBALROOT prefix is the documented way to make an NT-namespace
+// path openable through those Win32 APIs.
+std::wstring to_openable_path(const std::string &path)
+{
+    std::wstring wpath(path.begin(), path.end());
+    if (wpath.rfind(L"\\Device\\", 0) == 0) {
+        return L"\\\\?\\GLOBALROOT" + wpath;
+    }
+    return wpath;
+}
+
+// --- Export-symbol resolution ------------------------------------------
+//
+// "module+0xN" (below) tells you which file a thread starts in, but not
+// what's there -- an analyst still has to go look up that offset by hand.
+// Resolving the nearest preceding named export turns
+// "kernel32.dll+0x42990" into "kernel32.dll!LoadLibraryA+0x12", which is
+// immediately meaningful: that's the exact shape of the classic
+// remote-LoadLibrary injection technique inject_test.py's own
+// `loadlibrary` mode demonstrates.
+//
+// Exports are read directly from the on-disk PE file via
+// LOAD_LIBRARY_AS_IMAGE_RESOURCE, which maps it with real RVA-correct
+// layout (so the export directory's RVAs line up with the mapped base)
+// but runs no code -- no DllMain, no import resolution -- unlike the
+// deprecated DONT_RESOLVE_DLL_REFERENCES. This only depends on the
+// module's on-disk layout, not on which process it's actually loaded in,
+// so it's independent of ASLR: the file's *internal* RVA structure is the
+// same everywhere, only its base address differs per-process (and base is
+// already handled separately, in resolve_module_address's own base/size
+// bookkeeping).
+
+struct exported_symbol {
+    DWORD rva;
+    std::string name;
+};
+
+// Plain-old-data only, deliberately: MSVC (C2712) disallows __try/__except
+// in a function that also has local C++ objects needing unwind (like a
+// std::vector<std::string>), so the actual pointer-walking of the export
+// arrays -- reading RVAs and name strings out of a file that's untrusted
+// input we didn't produce -- is isolated in this small function with only
+// primitive locals, guarded by SEH against a malformed export directory
+// (bad NumberOfNames, a dangling RVA) causing an access violation. The
+// loader validates the PE headers themselves before LoadLibraryExW can
+// succeed at all, but not the export directory's internal consistency --
+// nothing walks that array until something (here, us) actually asks for
+// exports.
+struct raw_export_symbol {
+    DWORD rva;
+    char name[256];
+};
+
+DWORD collect_exports_raw(BYTE *base, DWORD export_rva, DWORD export_size,
+                           const IMAGE_EXPORT_DIRECTORY *exports,
+                           raw_export_symbol *out, DWORD max_out)
+{
+    DWORD count = 0;
+    __try {
+        auto *functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+        auto *names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+        auto *ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+
+        for (DWORD i = 0; i < exports->NumberOfNames && count < max_out; i++) {
+            WORD func_index = ordinals[i];
+            if (func_index >= exports->NumberOfFunctions) {
+                continue;
+            }
+
+            DWORD func_rva = functions[func_index];
+            if (func_rva == 0) {
+                continue;
+            }
+
+            // A forwarder's "RVA" actually points into the export
+            // directory itself (a string like "NTDLL.RtlAllocateHeap"),
+            // not real code -- not a landmark we can report an offset
+            // from, so skip it.
+            if (func_rva >= export_rva && func_rva < export_rva + export_size) {
+                continue;
+            }
+
+            const char *name_ptr = reinterpret_cast<const char *>(base + names[i]);
+            out[count].rva = func_rva;
+            strncpy_s(out[count].name, name_ptr, _TRUNCATE);
+            count++;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0; // any fault -> treat as unparseable, not a partial result
+    }
+    return count;
+}
+
+// Loads and parses one module's export table fresh -- callers should go
+// through load_module_exports_cached() instead; this is the expensive,
+// uncached path it wraps.
+std::vector<exported_symbol> load_module_exports(const std::wstring &openable_path)
+{
+    std::vector<exported_symbol> result;
+    if (openable_path.empty()) {
+        return result;
+    }
+
+    HMODULE h = LoadLibraryExW(openable_path.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (h == nullptr) {
+        // Not found, or an architecture mismatch (e.g. a 32-bit module
+        // from a WoW64 target being read by this 64-bit-only tool -- see
+        // the "32-bit Processes" limitation). Either way, the caller falls
+        // back to plain module+offset.
+        return result;
+    }
+
+    // LOAD_LIBRARY_AS_IMAGE_RESOURCE sets a low tag bit on the returned
+    // handle to mark it as resource-only; mask it off to get the real
+    // mapped base for reading. FreeLibrary below needs the *original*,
+    // unmasked handle -- per its documented contract for this flag.
+    BYTE *base = reinterpret_cast<BYTE *>(reinterpret_cast<ULONG_PTR>(h) & ~static_cast<ULONG_PTR>(3));
+
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+
+    // Reading the DOS/NT/optional headers themselves needs no SEH guard --
+    // LoadLibraryExW already validated them structurally to succeed at all.
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE && nt->Signature == IMAGE_NT_SIGNATURE) {
+        IMAGE_DATA_DIRECTORY export_entry = {};
+        if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            export_entry = reinterpret_cast<IMAGE_NT_HEADERS64 *>(nt)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        }
+        else if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            export_entry = reinterpret_cast<IMAGE_NT_HEADERS32 *>(nt)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        }
+
+        if (export_entry.VirtualAddress != 0 && export_entry.Size != 0) {
+            auto *exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + export_entry.VirtualAddress);
+
+            // Sanity cap, not a realistic limit (even ntdll.dll has under
+            // 3000) -- just a bound against a corrupt/hostile NumberOfNames
+            // driving an oversized allocation below.
+            constexpr DWORD kMaxExports = 16384;
+            // Not std::min() -- windows.h's own min/max macros (no NOMINMAX
+            // in this project) mangle it into a syntax error.
+            DWORD raw_capacity = (exports->NumberOfNames < kMaxExports) ? exports->NumberOfNames : kMaxExports;
+            std::vector<raw_export_symbol> raw(raw_capacity);
+
+            DWORD collected = collect_exports_raw(base, export_entry.VirtualAddress, export_entry.Size,
+                                                   exports, raw.data(), static_cast<DWORD>(raw.size()));
+
+            result.reserve(collected);
+            for (DWORD i = 0; i < collected; i++) {
+                result.push_back({ raw[i].rva, std::string(raw[i].name) });
+            }
+        }
+    }
+
+    FreeLibrary(h); // original handle, not the masked `base` -- see above
+
+    std::sort(result.begin(), result.end(),
+              [](const exported_symbol &a, const exported_symbol &b) { return a.rva < b.rva; });
+
+    return result;
+}
+
+std::unordered_map<std::string, std::vector<exported_symbol>> g_export_cache;
+std::mutex g_export_cache_mutex;
+
+// Reading and parsing a module's exports is real file I/O plus a walk over
+// a potentially-large array -- worth avoiding on every single event that
+// happens to land in a commonly-referenced module (kernel32.dll, ntdll.dll)
+// over a long-running trace, hence the cache. An empty result is cached
+// too, so a module we failed to parse once isn't retried on every
+// subsequent event referencing it.
+std::vector<exported_symbol> load_module_exports_cached(const std::string &module_path)
+{
+    std::lock_guard<std::mutex> lock(g_export_cache_mutex);
+    auto it = g_export_cache.find(module_path);
+    if (it != g_export_cache.end()) {
+        return it->second;
+    }
+
+    std::vector<exported_symbol> exports = load_module_exports(to_openable_path(module_path));
+    g_export_cache.emplace(module_path, exports);
+    return exports;
+}
+
+// Beyond this distance, "nearest preceding export" stops being a useful
+// landmark and starts being misleading -- claiming "!SomeFunction+0x50000"
+// implies the address is within that function, when it's really just
+// somewhere in a large stretch of unexported internal code that happens to
+// follow it. Past this, the caller falls back to a bare module+offset
+// instead of a specific (mis)attribution.
+constexpr uint64_t kMaxSymbolDistance = 0x10000; // 64KB
+
+std::optional<std::string> resolve_nearest_export(const std::string &module_path, uint64_t offset)
+{
+    std::vector<exported_symbol> exports = load_module_exports_cached(module_path);
+    if (exports.empty()) {
+        return std::nullopt;
+    }
+
+    // exports is sorted by rva ascending -- walk to the last entry at or
+    // before `offset`.
+    const exported_symbol *nearest = nullptr;
+    for (const exported_symbol &sym : exports) {
+        if (sym.rva > offset) {
+            break;
+        }
+        nearest = &sym;
+    }
+
+    if (nearest == nullptr || (offset - nearest->rva) > kMaxSymbolDistance) {
+        return std::nullopt;
+    }
+
+    std::ostringstream oss;
+    oss << nearest->name;
+    uint64_t delta = offset - nearest->rva;
+    if (delta != 0) {
+        oss << "+0x" << std::hex << delta;
+    }
+    return oss.str();
+}
+
+// populated: g_process_modules[pid] now holds a fresh live snapshot.
+// access_denied: the process is still running, but OpenProcess() was
+//   refused -- confirmed live to mean Protected Process Light (WinTcb
+//   level), for exactly the system processes this matters for (csrss.exe,
+//   wininit.exe, winlogon.exe). enable_debug_privilege() succeeding does
+//   NOT change this outcome: SeDebugPrivilege only bypasses normal
+//   discretionary access control, not PPL, which is a categorically
+//   stronger, deliberately un-bypassable boundary -- no Administrator
+//   process, privileged or not, can OpenProcess() a WinTcb-level process.
+//   This is expected, permanent behavior, not a bug to keep chasing.
+// unavailable: anything else (most commonly ERROR_INVALID_PARAMETER,
+//   meaning the process has already exited by resolution time) -- the
+//   ordinary, expected outcome for a short-lived process that's gone by
+//   the time the resolver thread gets to it.
+enum class live_snapshot_result {
+    populated,
+    access_denied,
+    unavailable,
+};
+
+// Fallback for when the passive ETW-based module cache has no confirmed
+// main image for a PID -- almost always because the process predates the
+// trace. krabs::provider::set_rundown_flags(), the mechanism meant to
+// backfill exactly this (a DCStart image-load event replayed for whatever
+// was already loaded when the trace started), was tried and confirmed
+// empirically not to work for this session type: a diagnostic default
+// event callback caught only a handful of unrelated EventTraceGuid
+// trace-header events, never anything image-load-shaped. Rather than keep
+// chasing that undocumented ETW feature, this asks the OS directly, via
+// the standard, documented Process Status API -- works identically
+// whether the process predates the trace or not, since it doesn't depend
+// on ETW history at all. Overwrites any partial ETW-tracked entries for
+// this PID outright rather than merging: if the main image was missing,
+// the rest of that PID's ETW-derived module list is equally suspect, and
+// a fresh live snapshot is by construction more complete.
+live_snapshot_result populate_modules_from_live_snapshot(uint32_t pid)
+{
+    HANDLE h_proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (h_proc == nullptr) {
+        return (GetLastError() == ERROR_ACCESS_DENIED) ? live_snapshot_result::access_denied
+                                                         : live_snapshot_result::unavailable;
+    }
+
+    std::vector<HMODULE> module_handles(256);
+    DWORD needed_bytes = 0;
+
+    bool ok = EnumProcessModulesEx(h_proc, module_handles.data(),
+        static_cast<DWORD>(module_handles.size() * sizeof(HMODULE)), &needed_bytes, LIST_MODULES_ALL) != 0;
+
+    // The process has more modules than fit in the first pass -- resize to
+    // exactly what's needed and retry once.
+    if (ok && needed_bytes > module_handles.size() * sizeof(HMODULE)) {
+        module_handles.resize(needed_bytes / sizeof(HMODULE));
+        ok = EnumProcessModulesEx(h_proc, module_handles.data(),
+            static_cast<DWORD>(module_handles.size() * sizeof(HMODULE)), &needed_bytes, LIST_MODULES_ALL) != 0;
+    }
+
+    if (!ok) {
+        CloseHandle(h_proc);
+        return live_snapshot_result::unavailable;
+    }
+
+    DWORD module_count = needed_bytes / sizeof(HMODULE);
+    std::vector<module_info> snapshot;
+    snapshot.reserve(module_count);
+
+    for (DWORD i = 0; i < module_count; i++) {
+        MODULEINFO mod_info = {};
+        wchar_t path_buf[MAX_PATH] = {};
+
+        if (GetModuleInformation(h_proc, module_handles[i], &mod_info, sizeof(mod_info)) &&
+            GetModuleFileNameExW(h_proc, module_handles[i], path_buf, ARRAYSIZE(path_buf)) > 0) {
+            std::wstring wpath(path_buf);
+            snapshot.push_back({
+                reinterpret_cast<uint64_t>(mod_info.lpBaseOfDll),
+                static_cast<uint64_t>(mod_info.SizeOfImage),
+                std::string(wpath.begin(), wpath.end())
+            });
+        }
+    }
+
+    CloseHandle(h_proc);
+
+    if (snapshot.empty()) {
+        return live_snapshot_result::unavailable;
+    }
+
+    std::lock_guard<std::mutex> lock(g_process_modules_mutex);
+    g_process_modules[pid] = std::move(snapshot);
+    return live_snapshot_result::populated;
+}
+
 std::string resolve_module_address(uint32_t pid, uint64_t address)
 {
     // A cache that merely has *some* entries for this PID isn't enough to
@@ -503,32 +898,81 @@ std::string resolve_module_address(uint32_t pid, uint64_t address)
     std::string process_name = lookup_process_name(pid);
     std::string expected_main_image = path_filename(process_name);
 
-    std::lock_guard<std::mutex> lock(g_process_modules_mutex);
-    auto it = g_process_modules.find(pid);
-
-    bool have_main_image = false;
-    if (it != g_process_modules.end() && process_name != "<unknown>") {
+    auto has_main_image = [&](void) {
+        auto it = g_process_modules.find(pid);
+        if (it == g_process_modules.end()) {
+            return false;
+        }
         for (const module_info &m : it->second) {
             if (iequals(path_filename(m.path), expected_main_image)) {
-                have_main_image = true;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool have_main_image = false;
+    if (process_name != "<unknown>") {
+        std::lock_guard<std::mutex> lock(g_process_modules_mutex);
+        have_main_image = has_main_image();
+    }
+
+    live_snapshot_result snapshot_result = live_snapshot_result::unavailable;
+    if (!have_main_image && process_name != "<unknown>") {
+        snapshot_result = populate_modules_from_live_snapshot(pid);
+        if (snapshot_result == live_snapshot_result::populated) {
+            std::lock_guard<std::mutex> lock(g_process_modules_mutex);
+            have_main_image = has_main_image();
+        }
+    }
+
+    if (!have_main_image) {
+        if (snapshot_result == live_snapshot_result::access_denied) {
+            return "<incomplete module info -- target is a Protected Process Light system process "
+                   "(e.g. csrss.exe/wininit.exe/winlogon.exe); no privilege level can OpenProcess() it>";
+        }
+        return "<incomplete module info for this PID -- not recorded by ETW, and no live snapshot available (process likely already exited)>";
+    }
+
+    // Only the lookup itself needs g_process_modules_mutex -- copy out the
+    // one matching entry and release before doing anything with it.
+    // resolve_nearest_export() below can trigger a slow, uncached
+    // LoadLibraryExW()+PE-parse (see load_module_exports_cached()), and
+    // g_process_modules_mutex is also what handle_image_load_event() needs
+    // on the single ETW dispatch thread that processes *every* kernel
+    // event (process, thread, and image-load alike -- ProcessTrace()
+    // delivers them all on one thread). Holding this lock across that slow
+    // work would risk stalling all kernel event processing for however
+    // long it takes, undermining the entire point of deferring this
+    // resolution off the callback thread in the first place.
+    std::optional<module_info> matched_module;
+    {
+        std::lock_guard<std::mutex> lock(g_process_modules_mutex);
+        auto it = g_process_modules.find(pid);
+        for (const module_info &m : it->second) {
+            if (address >= m.base && address < m.base + m.size) {
+                matched_module = m;
                 break;
             }
         }
     }
 
-    if (!have_main_image) {
-        return "<incomplete module info for this PID -- main executable not yet recorded by image rundown>";
+    if (!matched_module.has_value()) {
+        return "<UNBACKED -- not inside any known loaded module (possible injected code)>";
     }
 
-    for (const module_info &m : it->second) {
-        if (address >= m.base && address < m.base + m.size) {
-            std::ostringstream oss;
-            oss << m.path << "+0x" << std::hex << (address - m.base);
-            return oss.str();
-        }
-    }
+    uint64_t offset = address - matched_module->base;
+    std::optional<std::string> symbol = resolve_nearest_export(matched_module->path, offset);
 
-    return "<UNBACKED -- not inside any known loaded module (possible injected code)>";
+    std::ostringstream oss;
+    oss << matched_module->path;
+    if (symbol.has_value()) {
+        oss << "!" << *symbol;
+    }
+    else {
+        oss << "+0x" << std::hex << offset;
+    }
+    return oss.str();
 }
 
 // --- Authenticode signature verification (optional, -s/--verify-signatures) -
@@ -541,19 +985,8 @@ std::string resolve_module_address(uint32_t pid, uint64_t address)
 // depend on guessing what "normal" looks like from PID/address patterns
 // alone.
 //
-// WINTRUST_FILE_INFO/WinVerifyTrust only accept Win32-openable paths, but
-// the process-name cache can hold NT device paths from
-// resolve_process_path() ("\Device\HarddiskVolume4\..."), which CreateFile
-// rejects outright. The \\?\GLOBALROOT prefix is the documented way to make
-// an NT-namespace path openable through the Win32 file APIs.
-std::wstring to_openable_path(const std::string &path)
-{
-    std::wstring wpath(path.begin(), path.end());
-    if (wpath.rfind(L"\\Device\\", 0) == 0) {
-        return L"\\\\?\\GLOBALROOT" + wpath;
-    }
-    return wpath;
-}
+// (See to_openable_path() above -- WinVerifyTrust needs it too, for the
+// same NT-device-path reason.)
 
 // Best-effort: the embedded signer certificate's simple display name (e.g.
 // "Microsoft Corporation"), or empty if the file has no parseable PKCS#7
@@ -936,7 +1369,17 @@ struct pending_event {
     std::string target_name;
     bool has_start_addr;
     uint64_t start_addr;
-    bool is_initial_thread;
+    // Not resolved here -- is_initial_process_thread() depends on the
+    // process-name cache, which is populated by a *different* provider
+    // (process_provider) than this thread-create event came from, and is
+    // therefore subject to the same cross-CPU delivery race that motivates
+    // kResolveDelay for Win32StartAddr resolution below. Checking it
+    // synchronously here, before that race has had a chance to resolve,
+    // was a real bug: a target process's Thread-Start event can easily
+    // arrive before its own Process-Start event has been processed, making
+    // a genuine initial thread look like it isn't one. Recomputed in
+    // print_pending_event() instead, after the same grace period.
+    int64_t thread_event_time;
     bool is_kernel_mode_target;
     bool is_same_image;
     std::vector<std::string> payload_lines;
@@ -950,6 +1393,16 @@ std::atomic<bool> g_shutdown{ false };
 
 void print_pending_event(const pending_event &ev)
 {
+    // Resolved here, not in handle_thread_event -- see the comment on
+    // pending_event::thread_event_time. By now the resolver thread has
+    // already waited out kResolveDelay for this event, giving the target's
+    // Process-Start event (a different provider, racing on a different
+    // CPU) the same grace period Win32StartAddr resolution gets below to
+    // actually land in the process-name cache.
+    initial_thread_diagnosis initial_diag =
+        diagnose_initial_process_thread(ev.target_pid, ev.caller_pid, ev.thread_event_time);
+    bool is_initial_thread = initial_diag.is_initial_thread;
+
     // Resolved once up front (rather than inside the printing block below)
     // because is_same_image's suppression decision needs the result too --
     // see signer_confirmed_same_image.
@@ -990,21 +1443,37 @@ void print_pending_event(const pending_event &ev)
         caller_sig->valid && target_sig->valid && !caller_sig->signer.empty() &&
         iequals(caller_sig->signer, target_sig->signer);
 
-    // is_kernel_mode_target/is_initial_thread only reach here at all when
-    // g_verbose is set -- see handle_thread_event, which suppresses both by
-    // default the same way it suppresses SYSTEM_PID events, since all three
-    // are noise, not injection. signer_confirmed_same_image joins them here
-    // for the same reason. Plain is_same_image (no signature match, or -s
-    // not enabled) is different -- always shown, just labeled distinctly.
-    if (signer_confirmed_same_image && !g_verbose) {
+    // is_kernel_mode_target is suppressed by default back in
+    // handle_thread_event (self-contained in the event's own payload, no
+    // race to wait out). is_initial_thread and signer_confirmed_same_image
+    // are suppressed here instead, once their evidence is actually
+    // available -- both are noise, not injection, same as
+    // is_kernel_mode_target and SYSTEM_PID. Plain is_same_image (no
+    // signature match, or -s not enabled) is different -- always shown,
+    // just labeled distinctly.
+    if ((is_initial_thread || signer_confirmed_same_image) && !g_verbose) {
         return;
     }
+
+    // Resolved before acquiring cout_lock below, same reasoning as
+    // caller_sig/target_sig above: resolve_module_address() can trigger
+    // real, possibly-slow work (an uncached PE export parse, a live
+    // process snapshot), and doing that while holding g_cout_mutex would
+    // needlessly delay the stats thread's and the ETW callback thread's
+    // own (rarer) output for no reason.
+    std::optional<std::string> resolved_start_addr;
+    if (!ev.is_kernel_mode_target && ev.has_start_addr) {
+        resolved_start_addr = resolve_module_address(ev.target_pid, ev.start_addr);
+    }
+
+    // Held for the rest of this function -- see g_cout_mutex's comment.
+    std::lock_guard<std::mutex> cout_lock(g_cout_mutex);
 
     const char *label = "[!] Remote thread created: ";
     if (ev.is_kernel_mode_target) {
         label = "[i] Kernel-mode system thread, not a usermode injection target: ";
     }
-    else if (ev.is_initial_thread) {
+    else if (is_initial_thread) {
         label = "[i] Initial thread of newly created process (not injection): ";
     }
     else if (signer_confirmed_same_image) {
@@ -1022,6 +1491,27 @@ void print_pending_event(const pending_event &ev)
               << "  target PID=" << ev.target_pid << " (" << ev.target_name << ")"
               << std::endl;
 
+    // Explains *why* is_initial_thread came out the way it did, rather than
+    // leaving the verdict unexplained -- particularly useful for telling
+    // apart "target's Process-Start event still isn't in the cache" (the
+    // race this check lost to once already) from "it's there, but the
+    // recorded ParentId or timing genuinely didn't match" (a structurally
+    // different, later thread into an already-running process).
+    if (g_verbose) {
+        std::cout << "    [diag] initial-thread check: ";
+        if (!initial_diag.found_process_start_info) {
+            std::cout << "target's Process-Start event not in cache yet" << std::endl;
+        }
+        else {
+            std::cout << "recorded ParentId=" << initial_diag.recorded_parent_id
+                       << " (caller=" << ev.caller_pid
+                       << ", match=" << (initial_diag.recorded_parent_id == ev.caller_pid ? "yes" : "no") << ")"
+                       << "  time delta=" << (initial_diag.delta_100ns / 10000) << "ms"
+                       << "  verdict=" << (initial_diag.is_initial_thread ? "initial thread" : "not initial thread")
+                       << std::endl;
+        }
+    }
+
     if (iequals(path_filename(ev.caller_name), "svchost.exe")) {
         std::optional<std::string> service_group =
             extract_svchost_service_group(lookup_process_command_line(ev.caller_pid));
@@ -1038,10 +1528,8 @@ void print_pending_event(const pending_event &ev)
                   << "  (kernel-mode address; no usermode module cache applies)"
                   << std::endl;
     }
-    else if (ev.has_start_addr) {
-        std::cout << "    Win32StartAddr -> "
-                  << resolve_module_address(ev.target_pid, ev.start_addr)
-                  << std::endl;
+    else if (resolved_start_addr.has_value()) {
+        std::cout << "    Win32StartAddr -> " << *resolved_start_addr << std::endl;
     }
 
     if (g_verify_signatures) {
@@ -1169,18 +1657,18 @@ void handle_thread_event(const EVENT_RECORD &record, const krabs::trace_context 
             return;
         }
 
-        bool is_initial_thread = is_initial_process_thread(
-            target_pid, caller_pid, record.EventHeader.TimeStamp.QuadPart);
-        if (is_initial_thread && !g_verbose) {
-            return;
-        }
+        // Deliberately NOT checking is_initial_process_thread() here -- see
+        // the comment on pending_event::thread_event_time. It's resolved
+        // later, in print_pending_event(), after the same grace period
+        // Win32StartAddr resolution already waits out for exactly this kind
+        // of cross-provider race.
 
         pending_event ev;
         ev.caller_pid = caller_pid;
         ev.caller_name = lookup_process_name(caller_pid);
         ev.target_pid = target_pid;
         ev.target_name = lookup_process_name(target_pid);
-        ev.is_initial_thread = is_initial_thread;
+        ev.thread_event_time = record.EventHeader.TimeStamp.QuadPart;
         ev.is_kernel_mode_target = is_kernel_target;
         ev.is_same_image = (ev.caller_name != "<unknown>") &&
                             iequals(strip_volume_prefix(ev.caller_name), strip_volume_prefix(ev.target_name));
@@ -1237,6 +1725,11 @@ std::condition_variable g_stats_cv;
 
 void log_trace_stats(const krabs::trace_stats &stats, uint32_t &last_events_lost)
 {
+    // See g_cout_mutex's comment -- held for both lines below, so this
+    // block can't interleave with a print_pending_event() block underway
+    // on the resolver thread.
+    std::lock_guard<std::mutex> cout_lock(g_cout_mutex);
+
     std::cout << "[stats] events handled=" << stats.eventsHandled
               << "  events lost=" << stats.eventsLost
               << "  buffers written=" << stats.buffersWritten
@@ -1280,6 +1773,14 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (!enable_debug_privilege()) {
+        std::cerr << "[!] Warning: could not enable SeDebugPrivilege -- "
+                     "module resolution for protected system processes "
+                     "(wininit.exe, winlogon.exe, csrss.exe) will stay "
+                     "unavailable even though this process is elevated."
+                  << std::endl;
+    }
+
     krabs::kernel_trace trace(L"RemoteThreadTrace");
 
     EVENT_TRACE_PROPERTIES tuned_properties = build_tuned_trace_properties();
@@ -1293,6 +1794,12 @@ int main(int argc, char *argv[])
 
     krabs::kernel::image_load_provider image_load_provider;
     image_load_provider.add_on_event_callback(handle_image_load_event);
+
+    // Pre-existing processes' modules are backfilled on demand via
+    // populate_modules_from_live_snapshot() inside resolve_module_address()
+    // instead of via ETW rundown -- see that function's comment for why:
+    // krabs::provider::set_rundown_flags() was tried first and confirmed,
+    // empirically, not to produce usable events for this session type.
 
     // All providers on one session/logger, per the multi-provider pattern
     // Microsoft's own Office 365 Security team uses in production.
